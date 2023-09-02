@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -186,8 +187,17 @@ func main() {
 		}
 	}()
 
+	// Create a buffered channel to control the number of concurrent copy operations
+	numCores := runtime.NumCPU()
+	bufferSize := numCores / 2
+	if bufferSize < 1 {
+		bufferSize = 1
+	}
+	copySemaphore := make(chan struct{}, bufferSize)
+
 	copyFileVersionFn := func(awsKey string, awsVersion string, gcsObject *storage.ObjectHandle) {
 		defer wg.Done()
+		defer func() { <-copySemaphore }() // Release the semaphore when the function exits
 
 		s3ObjectOutput, err := s3Client.GetObject(&s3.GetObjectInput{
 			Bucket:    aws.String(s3Bucket),
@@ -244,11 +254,13 @@ func main() {
 
 		if len(s3VersionsOutput.Versions) == 1 {
 			wg.Add(1)
+			copySemaphore <- struct{}{} // Acquire the semaphore
 			go copyFileVersionFn(*s3Object.Key, *s3VersionsOutput.Versions[0].VersionId, gcsObject)
 		} else {
 			log.Printf("%s – %d versions detected", *s3Object.Key, len(s3VersionsOutput.Versions))
 			for _, s3Version := range s3VersionsOutput.Versions {
 				wg.Add(1)
+				copySemaphore <- struct{}{} // Acquire the semaphore
 				copyFileVersionFn(*s3Object.Key, *s3Version.VersionId, gcsObject)
 			}
 		}
@@ -298,8 +310,9 @@ func main() {
 				// get ETag from metadata
 				if gcsMetadataEtag, ok := gcsObjectAttrs.Metadata["ETag"]; ok {
 					if *s3Object.ETag != gcsObjectAttrs.Metadata["ETag"] {
-						log.Fatalf("Mismatch detected:\n  S3 object: %s\n  GCS object %s\n  S3 ETag: %s\n  GCS Metadata ETag: %s\n",
+						log.Printf("Mismatch detected:\n  S3 object: %s\n  GCS object %s\n  S3 ETag: %s\n  GCS Metadata ETag: %s\n",
 							*s3Object.Key, gcsObjectAttrs.Name, *s3Object.ETag, gcsMetadataEtag)
+						copyFileFn(s3Object, gcsObject)
 					} else {
 						log.Printf("Object %s match (ETag: %s)", *s3Object.Key, *s3Object.ETag)
 					}
